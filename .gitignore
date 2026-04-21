@@ -1,0 +1,29 @@
+# Claude Code settings (may contain tokens)
+.claude/
+
+# Environment — never commit real credentials
+.env
+.env.local
+.env.production
+
+# Dependencies
+node_modules/
+
+# Uploads (runtime files, not source)
+uploads/
+src/uploads/
+
+# Large data / test files
+*.xlsx
+*.xls
+*.txt
+*.docx
+
+# Logs
+*.log
+api.out.log
+api.err.log
+
+# OS
+.DS_Store
+Thumbs.db

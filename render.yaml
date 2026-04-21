@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: tds-reconciliation-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false          # set manually in Render dashboard
+      - key: DATABASE_SSL
+        value: "true"
+      - key: UPLOAD_DIR
+        value: uploads
+      - key: AUTH_TOKEN_SECRET
+        sync: false          # set manually in Render dashboard
+      - key: ADMIN_USERNAME
+        sync: false          # set manually in Render dashboard
+      - key: ADMIN_PASSWORD
+        sync: false          # set manually in Render dashboard

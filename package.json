@@ -1,0 +1,21 @@
+{
+  "name": "tds-reconciliation-api",
+  "version": "1.0.0",
+  "description": "Node API and PostgreSQL backend for TDS Form 26AS reconciliation",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "db:schema": "node src/scripts/print-schema-path.js",
+    "user:admin": "node src/scripts/create-admin-user.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "multer": "^2.0.0",
+    "pg": "^8.13.1",
+    "uuid": "^11.1.0",
+    "xlsx": "^0.18.5"
+  }
+}
