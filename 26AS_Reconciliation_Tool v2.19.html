@@ -313,7 +313,7 @@
               <input type="text" id="cc-map" value="505N=AAPCS0403H,566V=AAYCS6718A" style="width:340px">
             </label>
             <label>API Base URL:
-              <input type="text" id="api-base-url" value="https://tds-reconciliation-api.onrender.com" style="width:320px">
+              <input type="text" id="api-base-url" value="https://tds-reconciliation.onrender.com" style="width:320px">
             </label>
           </div>
           
@@ -760,7 +760,7 @@ const state = {
 };
 
 const files = { master:null, gl:[], tas:[] };
-const DEFAULT_API_BASE_URL = 'https://tds-reconciliation-api.onrender.com';
+const DEFAULT_API_BASE_URL = 'https://tds-reconciliation.onrender.com';
 
 function getApiBaseUrl(){
   const el = document.getElementById('api-base-url');
@@ -777,11 +777,25 @@ function restoreApiBaseUrl(){
   }
 }
 
-async function apiFetch(path, opts={}){
+async function apiFetch(path, opts={}, _retries=2){
   const headers = new Headers(opts.headers || {});
   const token = localStorage.getItem('tds_recon_auth_token');
   if(token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
-  const res = await fetch(getApiBaseUrl() + path, {...opts, headers});
+  let res;
+  try {
+    res = await fetch(getApiBaseUrl() + path, {...opts, headers});
+  } catch(networkErr) {
+    if(_retries > 0) {
+      await new Promise(r => setTimeout(r, 3000));
+      return apiFetch(path, opts, _retries - 1);
+    }
+    throw networkErr;
+  }
+  // Retry on gateway errors (Render.com cold-start 502/503/504)
+  if((res.status === 502 || res.status === 503 || res.status === 504) && _retries > 0){
+    await new Promise(r => setTimeout(r, 4000));
+    return apiFetch(path, opts, _retries - 1);
+  }
   let data = null;
   try{ data = await res.json(); }catch(_e){}
   if(!res.ok){
@@ -809,9 +823,9 @@ async function handleLogin(e){
   const btn = document.getElementById('btn-login');
   const error = document.getElementById('login-error');
   btn.disabled = true;
-  error.textContent = '';
+  error.textContent = 'Connecting to server…';
   try{
-    const res = await fetch(getApiBaseUrl() + '/api/auth/login', {
+    const data = await apiFetch('/api/auth/login', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
@@ -819,8 +833,8 @@ async function handleLogin(e){
         password: document.getElementById('login-password').value,
       }),
     });
-    const data = await res.json();
-    if(!res.ok) throw new Error(data.error || 'Login failed');
+    if(!data || !data.token) throw new Error('Login failed');
+    error.textContent = '';
     localStorage.setItem('tds_recon_auth_token', data.token);
     localStorage.setItem('tds_recon_user_role', data.user.role);
     localStorage.setItem('tds_recon_user', JSON.stringify(data.user));
@@ -6220,6 +6234,8 @@ document.getElementById('btn-clear-filters').addEventListener('click', () => {
 // On page load: restore auth state, apply role permissions, auto-load project for 'user' role
 (async () => {
   restoreApiBaseUrl();
+  // Warm up Render.com server in the background — avoids 502 on first real request
+  fetch(getApiBaseUrl() + '/health').catch(() => {});
   restoreLoginState();  // calls applyRolePermissions() internally when token exists
   const role = localStorage.getItem('tds_recon_user_role');
   const token = localStorage.getItem('tds_recon_auth_token');

@@ -765,10 +765,14 @@ async function getExceptions(projectId) {
 
 async function getFrontendState(projectId) {
   const project = await ensureProject(projectId);
-  const [mappingRows, glRowsResult, tasRowsResult, masterLookup] = await Promise.all([
+
+  const runResult = await query(
+    "select * from reconciliation_runs where project_id = $1 order by created_at desc limit 1",
+    [projectId],
+  );
+
+  const [mappingRows, masterLookup] = await Promise.all([
     query("select company_code, company_pan from company_code_mappings where project_id = $1", [projectId]),
-    query("select * from gl_entries where project_id = $1 order by posting_date nulls last, id", [projectId]),
-    query("select * from tas_transactions where project_id = $1 order by transaction_date nulls last, id", [projectId]),
     loadMasterLookup(projectId),
   ]);
 
@@ -777,166 +781,334 @@ async function getFrontendState(projectId) {
     ccMap[row.company_code] = row.company_pan;
   });
 
-  const companies = {};
-  const glByCompany = {};
-  const tasByCompany = {};
-  const glBlankCC = [];
-  const glUnknownCC = [];
-  const tasNonFinalByCompany = {};
+  const projectShape = {
+    id: project.id,
+    name: project.name,
+    clientName: project.client_name,
+    financialYear: project.financial_year,
+    tolerance: Number(project.tolerance),
+    onlyFinal: project.only_final,
+  };
 
-  glRowsResult.rows.forEach((row) => {
-    const companyCode = String(row.company_code || "").trim().toUpperCase();
-    if (!companyCode) {
-      glBlankCC.push({
-        docNo: row.document_number,
-        postingDate: row.posting_date,
-        amount: Number(row.amount),
-        assignment: row.assignment,
-        tanBook: row.tan_book_raw,
-        text: row.text_value,
-        sourceFile: row.source_file_name,
-        issue: "Blank Company Code - cannot route to any company",
-      });
-      return;
-    }
-
-    const companyPan = ccMap[companyCode];
-    if (!companyPan) {
-      glUnknownCC.push({
-        companyCode,
-        docNo: row.document_number,
-        postingDate: row.posting_date,
-        amount: Number(row.amount),
-        assignment: row.assignment,
-        tanBook: row.tan_book_raw,
-        text: row.text_value,
-        sourceFile: row.source_file_name,
-        issue: `Company Code "${companyCode}" not in CC map - update the map or remove these rows`,
-      });
-      return;
-    }
-
-    if (!glByCompany[companyPan]) glByCompany[companyPan] = [];
-    glByCompany[companyPan].push(row);
-  });
-
-  tasRowsResult.rows.forEach((row) => {
-    if (!row.company_pan) return;
-    if (!tasByCompany[row.company_pan]) tasByCompany[row.company_pan] = [];
-    tasByCompany[row.company_pan].push(row);
-    if (project.only_final && row.booking_status !== "F") {
-      if (!tasNonFinalByCompany[row.company_pan]) tasNonFinalByCompany[row.company_pan] = [];
-      tasNonFinalByCompany[row.company_pan].push(row);
-    }
-  });
-
-  const companyPans = new Set([...Object.keys(glByCompany), ...Object.keys(tasByCompany)]);
-  companyPans.forEach((companyPan) => {
-    const companyResult = reconcileCompany({
-      companyPan,
-      glRows: glByCompany[companyPan] || [],
-      tasRows: tasByCompany[companyPan] || [],
-      panMetadataByPan: masterLookup.panMetadataByPan,
-      tolerance: Number(project.tolerance),
-      onlyFinal: project.only_final,
-    });
-
-    companies[companyPan] = {
-      recon: companyResult.reconRows.map((row) => ({
-        pan: row.pan,
-        monthKey: row.monthKey,
-        monthLabel: row.monthLabel,
-        fy: row.financialYear,
-        quarter: row.quarterLabel,
-        customer: row.customerName,
-        region: row.region,
-        salesman: row.salesman,
-        rating: row.rating,
-        glAmount: row.glAmount,
-        tasTds: row.tasTds,
-        diff: row.differenceAmount,
-        glCount: row.glCount,
-        tasCount: row.tasCount,
-        glTans: row.glTans,
-        tasTans: row.tasTans,
-        tanCheck: row.tanCheck,
-        sections: row.sections,
-        assignments: row.assignments,
-        status: row.status,
-      })),
-      reports: companyResult.reports,
-      exceptions: companyResult.exceptions,
-      glRowsCount: (glByCompany[companyPan] || []).length,
-      tasRowsCount: project.only_final
-        ? (tasByCompany[companyPan] || []).filter((row) => row.booking_status === "F").length
-        : (tasByCompany[companyPan] || []).length,
-    };
-  });
-
-  return {
-    projectId,
-    project: {
-      id: project.id,
-      name: project.name,
-      clientName: project.client_name,
-      financialYear: project.financial_year,
-      tolerance: Number(project.tolerance),
-      onlyFinal: project.only_final,
-    },
-    master: {
-      agr2pan: Object.fromEntries(masterLookup.agreementToPan),
-      tan2pan: Object.fromEntries(masterLookup.tanToPan),
-      panMeta: Object.fromEntries([...masterLookup.panMetadataByPan.entries()].map(([pan, meta]) => [pan, {
+  const masterShape = {
+    agr2pan: Object.fromEntries(masterLookup.agreementToPan),
+    tan2pan: Object.fromEntries(masterLookup.tanToPan),
+    panMeta: Object.fromEntries(
+      [...masterLookup.panMetadataByPan.entries()].map(([pan, meta]) => [pan, {
         name: meta.customerName || "",
         region: meta.region || "",
         salesman: meta.salesman || "",
         customer: meta.exposureCustomerName || meta.customerName || "",
         rating: meta.rating || "",
-      }])),
-    },
-    gl: glRowsResult.rows.map((row) => ({
-      sourceFile: row.source_file_name,
-      account: row.account,
-      assignment: row.assignment,
-      docNo: row.document_number,
-      companyCode: row.company_code,
-      postingDate: row.posting_date,
-      documentDate: row.document_date,
-      amount: Number(row.amount),
-      localCurrency: row.local_currency,
-      text: row.text_value,
-      reference: row.reference,
-      tanBook: row.tan_book,
-      tanBookRaw: row.tan_book_raw,
+      }]),
+    ),
+  };
+
+  if (runResult.rowCount === 0) {
+    return {
+      projectId,
+      project: projectShape,
+      master: masterShape,
+      gl: [],
+      tas: {},
+      results: {
+        companies: {},
+        ccMap,
+        globalExceptions: { glBlankCC: [], glUnknownCC: [], tasNonFinalByCompany: {}, ccMap, onlyFinalFilter: project.only_final },
+      },
+    };
+  }
+
+  const latestRun = runResult.rows[0];
+  const tolerance = Number(latestRun.tolerance);
+
+  const [reconResult, exceptionsResult, glCountsResult, tasCountsResult] = await Promise.all([
+    query(
+      `select * from reconciliation_results
+       where project_id = $1 and reconciliation_run_id = $2
+       order by company_pan, month_key asc`,
+      [projectId, latestRun.id],
+    ),
+    query(
+      `select company_pan, exception_type, payload
+       from reconciliation_exceptions
+       where project_id = $1 and reconciliation_run_id = $2`,
+      [projectId, latestRun.id],
+    ),
+    query(
+      `select company_code, count(*)::int as cnt
+       from gl_entries where project_id = $1
+       group by company_code`,
+      [projectId],
+    ),
+    query(
+      `select company_pan, booking_status, count(*)::int as cnt
+       from tas_transactions where project_id = $1
+       group by company_pan, booking_status`,
+      [projectId],
+    ),
+  ]);
+
+  const glCountsByCompany = {};
+  glCountsResult.rows.forEach((row) => {
+    const companyPan = ccMap[String(row.company_code || "").trim().toUpperCase()];
+    if (companyPan) glCountsByCompany[companyPan] = (glCountsByCompany[companyPan] || 0) + row.cnt;
+  });
+
+  const tasCountsByCompany = {};
+  tasCountsResult.rows.forEach((row) => {
+    if (!row.company_pan) return;
+    if (!tasCountsByCompany[row.company_pan]) tasCountsByCompany[row.company_pan] = { total: 0, final: 0 };
+    tasCountsByCompany[row.company_pan].total += row.cnt;
+    if (row.booking_status === "F") tasCountsByCompany[row.company_pan].final += row.cnt;
+  });
+
+  const reconByCompany = {};
+  reconResult.rows.forEach((row) => {
+    if (!reconByCompany[row.company_pan]) reconByCompany[row.company_pan] = [];
+    reconByCompany[row.company_pan].push(row);
+  });
+
+  const exceptionsByCompany = {};
+  const globalExceptions = { glBlankCC: [], glUnknownCC: [], tasNonFinalByCompany: {} };
+  exceptionsResult.rows.forEach((row) => {
+    const payload = row.payload || [];
+    if (row.exception_type === "blank_company_code") {
+      globalExceptions.glBlankCC = Array.isArray(payload) ? payload : [];
+    } else if (row.exception_type === "unknown_company_code") {
+      globalExceptions.glUnknownCC = Array.isArray(payload) ? payload : [];
+    } else if (row.company_pan) {
+      if (row.exception_type === "tas_non_final") {
+        globalExceptions.tasNonFinalByCompany[row.company_pan] = Array.isArray(payload) ? payload : [];
+      } else {
+        if (!exceptionsByCompany[row.company_pan]) exceptionsByCompany[row.company_pan] = {};
+        exceptionsByCompany[row.company_pan][row.exception_type] = Array.isArray(payload) ? payload : [];
+      }
+    }
+  });
+
+  const companies = {};
+  for (const [companyPan, rows] of Object.entries(reconByCompany)) {
+    const recon = rows.map((row) => ({
       pan: row.pan,
       monthKey: row.month_key,
       monthLabel: row.month_label,
       fy: row.financial_year,
       quarter: row.quarter_label,
-    })),
-    tas: Object.fromEntries(Object.entries(tasByCompany).map(([companyPan, rows]) => [companyPan, rows.map((row) => ({
-      sourceFile: row.source_file_name,
-      tan: row.tan,
-      deductor: row.deductor_name,
-      section: row.section_code,
-      txnDate: row.transaction_date,
-      bookingStatus: row.booking_status,
-      amtPaid: Number(row.amount_paid),
-      tds: Number(row.tax_deducted),
-      tdsDeposited: Number(row.tds_deposited),
-      pan: row.pan,
-      monthKey: row.month_key,
-      monthLabel: row.month_label,
-      fy: row.financial_year,
-      quarter: row.quarter_label,
-    }))])),
+      customer: row.customer_name,
+      region: row.region,
+      salesman: row.salesman,
+      rating: row.rating,
+      glAmount: Number(row.gl_amount),
+      tasTds: Number(row.tas_tds),
+      diff: Number(row.difference_amount),
+      glCount: Number(row.gl_count),
+      tasCount: Number(row.tas_count),
+      glTans: row.gl_tans,
+      tasTans: row.tas_tans,
+      tanCheck: row.tan_check,
+      sections: row.sections,
+      assignments: row.assignments,
+      status: row.status,
+    }));
+
+    // Build PAN summary
+    const panSummaryMap = new Map();
+    rows.forEach((row) => {
+      if (!panSummaryMap.has(row.pan)) {
+        panSummaryMap.set(row.pan, {
+          pan: row.pan,
+          customerName: row.customer_name,
+          customer: row.customer_name,
+          region: row.region,
+          salesman: row.salesman,
+          rating: row.rating,
+          glAmount: 0,
+          tasTds: 0,
+          glCount: 0,
+          tasCount: 0,
+          monthCount: 0,
+          glTans: new Set(),
+          tasTans: new Set(),
+          months: [],
+        });
+      }
+      const s = panSummaryMap.get(row.pan);
+      s.glAmount += Number(row.gl_amount);
+      s.tasTds += Number(row.tas_tds);
+      s.glCount += Number(row.gl_count);
+      s.tasCount += Number(row.tas_count);
+      s.monthCount += 1;
+      String(row.gl_tans || "").split(",").map((v) => v.trim()).filter(Boolean).forEach((v) => s.glTans.add(v));
+      String(row.tas_tans || "").split(",").map((v) => v.trim()).filter(Boolean).forEach((v) => s.tasTans.add(v));
+      s.months.push({
+        monthLabel: row.month_label,
+        monthKey: row.month_key,
+        fy: row.financial_year,
+        quarter: row.quarter_label,
+        glAmount: Number(row.gl_amount),
+        tasTds: Number(row.tas_tds),
+        diff: Number(row.difference_amount),
+        glCount: Number(row.gl_count),
+        tasCount: Number(row.tas_count),
+        status: row.status,
+        sections: row.sections,
+        glTans: row.gl_tans,
+        tasTans: row.tas_tans,
+      });
+    });
+
+    const pansummary = [...panSummaryMap.values()].map((s) => {
+      const differenceAmount = Number((s.glAmount - s.tasTds).toFixed(2));
+      let status = "Transaction more in 26AS";
+      if (Math.abs(differenceAmount) <= tolerance) status = "Perfect Match";
+      else if (s.tasCount === 0) status = "Party not in 26AS";
+      else if (s.glCount === 0) status = "Party not in Books";
+      else if (differenceAmount > 0) status = "Transaction more in Books";
+      return {
+        ...s,
+        glAmount: Number(s.glAmount.toFixed(2)),
+        tasTds: Number(s.tasTds.toFixed(2)),
+        differenceAmount,
+        variance: differenceAmount,
+        glTans: [...s.glTans].sort().join(", "),
+        tasTans: [...s.tasTans].sort().join(", "),
+        status,
+      };
+    }).sort((a, b) => Math.abs(b.differenceAmount) - Math.abs(a.differenceAmount));
+
+    // Build FY summary with row-level status counts
+    const fyMap = new Map();
+    rows.forEach((row) => {
+      const fy = row.financial_year;
+      if (!fy) return;
+      if (!fyMap.has(fy)) {
+        fyMap.set(fy, { fy, glAmount: 0, tasTds: 0, glCount: 0, tasCount: 0, panSet: new Set(), perfect: 0, mismatch: 0, glOnly: 0, tasOnly: 0 });
+      }
+      const f = fyMap.get(fy);
+      f.glAmount += Number(row.gl_amount);
+      f.tasTds += Number(row.tas_tds);
+      f.glCount += Number(row.gl_count);
+      f.tasCount += Number(row.tas_count);
+      f.panSet.add(row.pan);
+      if (row.status === "Perfect Match") f.perfect += 1;
+      else if (row.status === "Amount Mismatch") f.mismatch += 1;
+      else if (row.status === "GL Only") f.glOnly += 1;
+      else if (row.status === "26AS Only") f.tasOnly += 1;
+    });
+    const fySummary = [...fyMap.values()].map((f) => ({
+      fy: f.fy,
+      glAmount: Number(f.glAmount.toFixed(2)),
+      tasTds: Number(f.tasTds.toFixed(2)),
+      variance: Number((f.glAmount - f.tasTds).toFixed(2)),
+      glCount: f.glCount,
+      tasCount: f.tasCount,
+      panCount: f.panSet.size,
+      perfect: f.perfect,
+      mismatch: f.mismatch,
+      glOnly: f.glOnly,
+      tasOnly: f.tasOnly,
+    })).sort((a, b) => a.fy.localeCompare(b.fy));
+
+    // Build PAN×FY summary
+    const panFyMap = new Map();
+    rows.forEach((row) => {
+      const key = `${row.pan}|${row.financial_year}`;
+      if (!panFyMap.has(key)) {
+        panFyMap.set(key, {
+          pan: row.pan,
+          customer: row.customer_name,
+          fy: row.financial_year,
+          glAmount: 0,
+          tasTds: 0,
+          glCount: 0,
+          tasCount: 0,
+          monthCount: 0,
+        });
+      }
+      const pf = panFyMap.get(key);
+      pf.glAmount += Number(row.gl_amount);
+      pf.tasTds += Number(row.tas_tds);
+      pf.glCount += Number(row.gl_count);
+      pf.tasCount += Number(row.tas_count);
+      pf.monthCount += 1;
+    });
+    const panFy = [...panFyMap.values()].map((pf) => ({
+      ...pf,
+      glAmount: Number(pf.glAmount.toFixed(2)),
+      tasTds: Number(pf.tasTds.toFixed(2)),
+      variance: Number((pf.glAmount - pf.tasTds).toFixed(2)),
+    }));
+
+    // Build TAN summary from stored comma-separated gl_tans/tas_tans
+    const tanMap = new Map();
+    rows.forEach((row) => {
+      const glTanList = String(row.gl_tans || "").split(",").map((v) => v.trim()).filter(Boolean);
+      const tasTanList = String(row.tas_tans || "").split(",").map((v) => v.trim()).filter(Boolean);
+      const glShare = glTanList.length > 0 ? 1 / glTanList.length : 0;
+      const tasShare = tasTanList.length > 0 ? 1 / tasTanList.length : 0;
+      new Set([...glTanList, ...tasTanList]).forEach((tan) => {
+        if (!tanMap.has(tan)) tanMap.set(tan, { key: tan, label: tan, glAmount: 0, tasTds: 0, glCount: 0, tasCount: 0 });
+      });
+      glTanList.forEach((tan) => {
+        const t = tanMap.get(tan);
+        t.glAmount += Number(row.gl_amount) * glShare;
+        t.glCount += Number(row.gl_count) * glShare;
+      });
+      tasTanList.forEach((tan) => {
+        const t = tanMap.get(tan);
+        t.tasTds += Number(row.tas_tds) * tasShare;
+        t.tasCount += Number(row.tas_count) * tasShare;
+      });
+    });
+    const tanSummary = [...tanMap.values()].map((t) => ({
+      ...t,
+      glAmount: Number(t.glAmount.toFixed(2)),
+      tasTds: Number(t.tasTds.toFixed(2)),
+      glCount: Math.round(t.glCount),
+      tasCount: Math.round(t.tasCount),
+      diff: Number((t.glAmount - t.tasTds).toFixed(2)),
+    })).sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+
+    const compExc = exceptionsByCompany[companyPan] || {};
+    const exceptions = {
+      glUnmappedAssignments: compExc.gl_unmapped_assignments || [],
+      tasUnmappedTans: compExc.tas_unmapped_tans || [],
+      tanCrossCheckMismatches: compExc.tan_cross_check_mismatches || [],
+      nonFinalTransactions: compExc.tas_non_final || [],
+    };
+
+    const tasCount = tasCountsByCompany[companyPan];
+    companies[companyPan] = {
+      recon,
+      reports: {
+        pansummary,
+        fySummary,
+        panFy,
+        tan: tanSummary,
+        pan: [],
+        customer: [],
+        region: [],
+        salesman: [],
+        rating: [],
+      },
+      exceptions,
+      glRowsCount: glCountsByCompany[companyPan] || 0,
+      tasRowsCount: tasCount ? (project.only_final ? tasCount.final : tasCount.total) : 0,
+    };
+  }
+
+  return {
+    projectId,
+    project: projectShape,
+    master: masterShape,
+    gl: [],
+    tas: {},
     results: {
       companies,
       ccMap,
       globalExceptions: {
-        glBlankCC,
-        glUnknownCC,
-        tasNonFinalByCompany,
+        ...globalExceptions,
         ccMap,
         onlyFinalFilter: project.only_final,
       },
